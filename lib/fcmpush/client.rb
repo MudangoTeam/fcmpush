@@ -2,6 +2,7 @@ require 'fcmpush/exceptions'
 require 'fcmpush/batch'
 require 'fcmpush/json_response'
 require 'fcmpush/batch_response'
+require 'httpx'
 
 module Fcmpush
   V1_ENDPOINT_PREFIX = '/v1/projects/'.freeze
@@ -53,6 +54,12 @@ module Fcmpush
       raise NetworkError, "A network error occurred: #{e.class} (#{e.message})"
     end
 
+    def push_batch(messages, query: {}, headers: {})
+      make_push_requests(messages, query, headers)
+    rescue Timeout::Error, Errno::EINVAL, Errno::ECONNRESET, EOFError, Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError, Net::ProtocolError => e
+      raise NetworkError, "A network error occurred: #{e.class} (#{e.message})"
+    end
+
     def subscribe(topic, *instance_ids, query: {}, headers: {})
       uri, request = make_subscription_request(topic, *instance_ids, :subscribe, query, headers)
       response = exception_handler(connection.request(uri, request))
@@ -69,14 +76,6 @@ module Fcmpush
       raise NetworkError, "A network error occurred: #{e.class} (#{e.message})"
     end
 
-    def batch_push(messages, query: {}, headers: {})
-      uri, request = make_batch_request(messages, query, headers)
-      response = exception_handler(connection.request(uri, request))
-      BatchResponse.new(response)
-    rescue Timeout::Error, Errno::EINVAL, Errno::ECONNRESET, EOFError, Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError, Net::ProtocolError => e
-      raise NetworkError, "A network error occurred: #{e.class} (#{e.message})"
-    end
-
     private
 
       def make_push_request(body, query, headers)
@@ -89,6 +88,23 @@ module Fcmpush
         post.body = body.is_a?(String) ? body : body.to_json
 
         [uri, post]
+      end
+
+      def make_push_requests(messages, _query, headers)
+        access_token_refresh
+        headers = v1_authorized_header(headers)
+
+        client = HTTPX.plugin(:expect, :compression).with(headers: headers)
+
+        url = "#{domain}#{path}".freeze
+
+        requests = messages.map { |message| ['POST', url, { json: message }] }
+
+        responses = client.request(requests)
+
+        client.close
+
+        responses
       end
 
       def make_subscription_request(topic, instance_ids, type, query, headers)
@@ -132,24 +148,11 @@ module Fcmpush
       end
 
       def make_subscription_body(topic, *instance_ids)
-        topic = topic.match(%r{^/topics/}) ? topic : '/topics/' + topic
+        topic = topic.match(%r{^/topics/}) ? topic : "/topics/#{topic}"
         {
           to: topic,
           registration_tokens: instance_ids
         }.to_json
-      end
-
-      def make_batch_request(messages, query, headers)
-        uri = URI.join(domain, BATCH_ENDPOINT)
-        uri.query = URI.encode_www_form(query) unless query.empty?
-
-        access_token_refresh
-        headers = v1_authorized_header(headers)
-        post = Net::HTTP::Post.new(uri, headers)
-        post['Content-Type'] = "multipart/mixed; boundary=#{::Fcmpush::Batch::PART_BOUNDRY}"
-        post.body = make_batch_payload(messages, headers)
-
-        [uri, post]
       end
   end
 end
